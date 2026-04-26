@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from tips_generator import Tip, generate_tips, tips_to_template_variables
+
 
 @dataclass
 class Config:
@@ -20,6 +22,7 @@ class Config:
     twilio_auth_token: str
     twilio_from_whatsapp: str
     twilio_content_sid: str
+    gemini_api_key: str
     users_csv: str
     name_column: str
     phone_column: str
@@ -89,6 +92,7 @@ def load_config(args: argparse.Namespace) -> Config:
         twilio_auth_token=require_env("TWILIO_AUTH_TOKEN"),
         twilio_from_whatsapp=require_env("TWILIO_WHATSAPP_FROM"),
         twilio_content_sid=require_env("TWILIO_CONTENT_SID"),
+        gemini_api_key=require_env("GEMINI_API_KEY"),
         users_csv=args.users_csv,
         name_column=args.name_column,
         phone_column=args.phone_column,
@@ -110,7 +114,11 @@ def format_whatsapp_address(phone: str) -> str:
     return f"whatsapp:{phone}"
 
 
-def send_template(cfg: Config, to_whatsapp: str, name: str) -> tuple[bool, str]:
+def send_template(
+    cfg: Config,
+    to_whatsapp: str,
+    variables: dict[str, str],
+) -> tuple[bool, str]:
     endpoint = (
         f"https://api.twilio.com/2010-04-01/Accounts/"
         f"{cfg.twilio_account_sid}/Messages.json"
@@ -120,14 +128,10 @@ def send_template(cfg: Config, to_whatsapp: str, name: str) -> tuple[bool, str]:
         "To": to_whatsapp,
         "From": cfg.twilio_from_whatsapp,
         "ContentSid": cfg.twilio_content_sid,
-        # Twilio Content Templates use numeric keys for variables.
-        # "1" maps to the first variable in the template body.
-        "ContentVariables": json.dumps({"1": name}, ensure_ascii=True),
+        "ContentVariables": json.dumps(variables, ensure_ascii=True),
     }
 
-    basic_auth = (
-        f"{cfg.twilio_account_sid}:{cfg.twilio_auth_token}".encode("utf-8")
-    )
+    basic_auth = f"{cfg.twilio_account_sid}:{cfg.twilio_auth_token}".encode("utf-8")
     auth_header = "Basic " + base64.b64encode(basic_auth).decode("utf-8")
 
     request = urllib.request.Request(
@@ -218,6 +222,17 @@ def run(cfg: Config) -> int:
         log_line("ERROR", "No users found in CSV.")
         return 1
 
+    log_line("INFO", "Generating weekly tips via Gemini + Google Search...")
+    try:
+        tips = generate_tips(cfg.gemini_api_key)
+    except Exception as exc:
+        log_line("ERROR", f"Failed to generate tips: {exc}")
+        return 1
+
+    log_line("INFO", f"Generated {len(tips)} tips:")
+    for i, tip in enumerate(tips, start=1):
+        log_line("INFO", f"  {i}. [{tip.title}] {tip.body}")
+
     sent = 0
     failed = 0
     skipped = 0
@@ -254,6 +269,7 @@ def run(cfg: Config) -> int:
             continue
 
         to_whatsapp = format_whatsapp_address(phone)
+        variables = tips_to_template_variables(raw_name, tips)
 
         if cfg.dry_run:
             dry_run_count += 1
@@ -261,12 +277,12 @@ def run(cfg: Config) -> int:
                 "INFO",
                 (
                     f"[{index}/{len(users)}] PREVIEW to={to_whatsapp} "
-                    f"nombre='{raw_name}' content_sid={cfg.twilio_content_sid}"
+                    f"nombre='{raw_name}' variables={json.dumps(variables)}"
                 ),
             )
             continue
 
-        ok, result = send_template(cfg, to_whatsapp=to_whatsapp, name=raw_name)
+        ok, result = send_template(cfg, to_whatsapp=to_whatsapp, variables=variables)
         if ok:
             sent += 1
             log_line(
